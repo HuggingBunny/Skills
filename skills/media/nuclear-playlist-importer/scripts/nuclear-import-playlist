@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""
+Import or sync any YouTube playlist directly into Nuclear Music Player.
+Formats items for the nucleartube-streaming provider and restarts Nuclear
+if running so the UI updates immediately.
+
+Completely portable: dynamically detects platform paths (Linux, macOS, Windows)
+and works standalone or with any AI Agent harness.
+"""
+
+import sys
+import os
+import json
+import uuid
+import datetime
+import subprocess
+import argparse
+import time
+import shutil
+from pathlib import Path
+
+STREAMING_PROVIDER = "nucleartube-streaming"
+
+
+def find_nuclear_data_dir() -> Path:
+    """Dynamically locate Nuclear's data directory across Linux, macOS, and Windows."""
+    if "NUCLEAR_DATA_DIR" in os.environ:
+        p = Path(os.environ["NUCLEAR_DATA_DIR"]).expanduser()
+        if p.exists():
+            return p
+
+    home = Path.home()
+    candidates = [
+        # Linux (XDG / Tauri)
+        home / ".local/share/com.nuclearplayer",
+        home / ".config/nuclear",
+        # macOS
+        home / "Library/Application Support/com.nuclearplayer",
+        home / "Library/Application Support/nuclear",
+        # Windows
+        Path(os.environ["APPDATA"]) / "com.nuclearplayer" if "APPDATA" in os.environ else None,
+        Path(os.environ["APPDATA"]) / "nuclear" if "APPDATA" in os.environ else None,
+    ]
+    for c in candidates:
+        if c and c.exists():
+            return c
+
+    # Fallback default for Linux
+    return home / ".local/share/com.nuclearplayer"
+
+
+def find_nuclear_bin() -> str:
+    """Dynamically locate Nuclear executable binary."""
+    if "NUCLEAR_BIN" in os.environ:
+        return os.environ["NUCLEAR_BIN"]
+
+    for name in ["nuclear-music-player", "nuclear", "Nuclear"]:
+        found = shutil.which(name)
+        if found:
+            return found
+
+    candidates = [
+        Path("/usr/bin/nuclear-music-player"),
+        Path("/usr/bin/nuclear"),
+        Path("/usr/local/bin/nuclear"),
+        Path("/Applications/Nuclear.app/Contents/MacOS/Nuclear"),
+    ]
+    for c in candidates:
+        if c.exists() and os.access(c, os.X_OK):
+            return str(c)
+
+    return "nuclear-music-player"
+
+
+def get_ytdlp_cmd(data_dir: Path) -> str:
+    """Find yt-dlp either in Nuclear's bundled directory or in system PATH."""
+    bundled_candidates = [
+        data_dir / "ytdlp/yt-dlp_linux",
+        data_dir / "ytdlp/yt-dlp_macos",
+        data_dir / "ytdlp/yt-dlp.exe",
+        data_dir / "ytdlp/yt-dlp",
+    ]
+    for b in bundled_candidates:
+        if b.exists() and os.access(b, os.X_OK):
+            return str(b)
+
+    sys_ytdlp = shutil.which("yt-dlp")
+    if sys_ytdlp:
+        return sys_ytdlp
+
+    return "yt-dlp"
+
+
+def now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def fetch_youtube_playlist(url: str, ytdlp_cmd: str) -> dict:
+    cmd = [
+        ytdlp_cmd,
+        "--flat-playlist",
+        "-J",
+        url
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return json.loads(res.stdout)
+
+
+def select_best_thumbnail(thumbnails: list, video_id: str) -> str:
+    if thumbnails:
+        sorted_thumbs = sorted(thumbnails, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
+        if sorted_thumbs and sorted_thumbs[-1].get("url"):
+            return sorted_thumbs[-1]["url"]
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+
+def get_running_nuclear_pids() -> list[int]:
+    """Find running Nuclear process IDs excluding self."""
+    my_pid = os.getpid()
+    pids = set()
+    for proc_name in ["nuclear-music-player", "nuclear", "Nuclear"]:
+        try:
+            res = subprocess.run(["pgrep", "-f", proc_name], capture_output=True, text=True)
+            for line in res.stdout.strip().split():
+                if line.isdigit():
+                    pid = int(line)
+                    if pid != my_pid:
+                        pids.add(pid)
+        except Exception:
+            pass
+    return list(pids)
+
+
+def import_playlist(url: str, custom_name: str | None = None, auto_restart: bool = True) -> dict:
+    data_dir = find_nuclear_data_dir()
+    playlists_dir = data_dir / "playlists"
+    index_file = playlists_dir / "index.json"
+    ytdlp_cmd = get_ytdlp_cmd(data_dir)
+    nuclear_bin = find_nuclear_bin()
+
+    playlists_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Fetching playlist metadata from YouTube: {url}")
+    yt_data = fetch_youtube_playlist(url, ytdlp_cmd)
+    entries = yt_data.get("entries")
+    if entries is None:
+        if yt_data.get("id"):
+            entries = [yt_data]
+        else:
+            entries = []
+    playlist_name = custom_name or yt_data.get("title") or "Imported YouTube Playlist"
+
+    print(f"Found '{playlist_name}' with {len(entries)} tracks.")
+
+    # Check running Nuclear instances
+    running_pids = get_running_nuclear_pids()
+    was_running = len(running_pids) > 0
+
+    # If Nuclear is running and restart requested, terminate it to avoid in-memory store collisions
+    if was_running and auto_restart:
+        print("Stopping running Nuclear instance to avoid cache collision...")
+        for p in running_pids:
+            try:
+                os.kill(p, 15)  # SIGTERM
+            except OSError:
+                pass
+        time.sleep(1.5)
+        for p in running_pids:
+            try:
+                os.kill(p, 9)  # Force kill if still lingering
+            except OSError:
+                pass
+
+    # Load existing index.json
+    index_data = {"entries": []}
+    if index_file.exists():
+        try:
+            with open(index_file, "r", encoding="utf-8") as f:
+                index_data = json.load(f)
+        except Exception:
+            index_data = {"entries": []}
+
+    playlist_id = None
+    index_entry_idx = -1
+    for i, entry in enumerate(index_data.get("entries", [])):
+        if entry.get("name") == playlist_name:
+            playlist_id = entry.get("id")
+            index_entry_idx = i
+            break
+
+    now = now_iso()
+
+    if playlist_id:
+        playlist_file = playlists_dir / f"{playlist_id}.json"
+        if playlist_file.exists():
+            with open(playlist_file, "r", encoding="utf-8") as f:
+                raw_data = json.load(f)
+                playlist_data = raw_data.get("playlist", {})
+        else:
+            playlist_data = {
+                "id": playlist_id,
+                "name": playlist_name,
+                "createdAtIso": now,
+                "lastModifiedIso": now,
+                "isReadOnly": False,
+                "items": []
+            }
+    else:
+        playlist_id = str(uuid.uuid4())
+        playlist_data = {
+            "id": playlist_id,
+            "name": playlist_name,
+            "createdAtIso": now,
+            "lastModifiedIso": now,
+            "isReadOnly": False,
+            "items": []
+        }
+
+    existing_items = playlist_data.get("items", [])
+    existing_ids = {
+        item.get("track", {}).get("source", {}).get("id")
+        for item in existing_items
+        if item.get("track", {}).get("source", {}).get("id")
+    }
+
+    added_count = 0
+    for entry in entries:
+        vid_id = entry.get("id")
+        if not vid_id or vid_id in existing_ids:
+            continue
+
+        title = entry.get("title") or "Unknown Title"
+        uploader = entry.get("uploader") or entry.get("channel") or "Unknown Artist"
+        duration_s = entry.get("duration") or 0
+        duration_ms = int(duration_s * 1000) if duration_s else 0
+        thumb_url = select_best_thumbnail(entry.get("thumbnails"), vid_id)
+
+        item = {
+            "id": str(uuid.uuid4()),
+            "addedAtIso": now,
+            "track": {
+                "title": title,
+                "artists": [
+                    {
+                        "name": uploader,
+                        "roles": []
+                    }
+                ],
+                "durationMs": duration_ms,
+                "source": {
+                    "id": vid_id,
+                    "provider": STREAMING_PROVIDER
+                },
+                "artwork": {
+                    "items": [
+                        {
+                            "purpose": "thumbnail",
+                            "url": thumb_url
+                        }
+                    ]
+                }
+            }
+        }
+        existing_items.append(item)
+        existing_ids.add(vid_id)
+        added_count += 1
+
+    playlist_data["items"] = existing_items
+    playlist_data["lastModifiedIso"] = now
+
+    thumbs = []
+    for item in existing_items:
+        art_items = item.get("track", {}).get("artwork", {}).get("items", [])
+        for art in art_items:
+            u = art.get("url")
+            if u and u not in thumbs:
+                thumbs.append(u)
+        if len(thumbs) >= 4:
+            break
+
+    total_duration_ms = sum(
+        item.get("track", {}).get("durationMs", 0) or 0
+        for item in existing_items
+    )
+
+    # Atomic playlist write
+    target_playlist_file = playlists_dir / f"{playlist_id}.json"
+    tmp_playlist_file = playlists_dir / f".{playlist_id}.json.tmp"
+    with open(tmp_playlist_file, "w", encoding="utf-8") as f:
+        json.dump({"playlist": playlist_data}, f, indent=2)
+    tmp_playlist_file.replace(target_playlist_file)
+
+    # Atomic index write
+    index_entry = {
+        "id": playlist_id,
+        "name": playlist_name,
+        "createdAtIso": playlist_data.get("createdAtIso", now),
+        "lastModifiedIso": now,
+        "isReadOnly": False,
+        "itemCount": len(existing_items),
+        "totalDurationMs": total_duration_ms,
+        "thumbnails": thumbs
+    }
+
+    if index_entry_idx >= 0:
+        index_data["entries"][index_entry_idx] = index_entry
+    else:
+        index_data["entries"].append(index_entry)
+
+    tmp_index_file = playlists_dir / ".index.json.tmp"
+    with open(tmp_index_file, "w", encoding="utf-8") as f:
+        json.dump(index_data, f, indent=2)
+    tmp_index_file.replace(index_file)
+
+    duration_hrs = total_duration_ms / 3600000.0
+    print(f"Success: Playlist '{playlist_name}' saved ({len(existing_items)} tracks, {duration_hrs:.1f} hours).")
+
+    # Relaunch Nuclear if it was running
+    if was_running and auto_restart:
+        print("Relaunching Nuclear Music Player...")
+        subprocess.Popen([nuclear_bin], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        time.sleep(1)
+
+    return {
+        "id": playlist_id,
+        "name": playlist_name,
+        "total_tracks": len(existing_items),
+        "new_tracks_added": added_count,
+        "duration_hours": round(duration_hrs, 1)
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Import YouTube playlist into Nuclear Music Player")
+    parser.add_argument("url", help="YouTube playlist URL")
+    parser.add_argument("--name", help="Custom playlist name in Nuclear (default: YouTube playlist title)")
+    parser.add_argument("--no-restart", action="store_true", help="Do not restart Nuclear if it is running")
+
+    args = parser.parse_args()
+    try:
+        import_playlist(args.url, custom_name=args.name, auto_restart=not args.no_restart)
+    except subprocess.CalledProcessError as e:
+        print(f"Error executing yt-dlp: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
